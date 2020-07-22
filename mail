@@ -1,0 +1,137 @@
+#!/usr/bin/python
+import asyncio
+import json
+import sys
+from getpass import getpass
+from os import getenv
+from pathlib import Path
+from typing import Optional
+
+from nio import (
+    AsyncClient,
+    JoinResponse,
+    LoginResponse,
+    MatrixRoom,
+    RoomMemberEvent,
+)
+
+
+# Fix some user_id-in-filename issues
+from nio.crypto import TrustState
+from nio.store import DefaultStore, KeyStore, MatrixStore
+def _default_store_post_init(self):
+    super(type(self), self).__post_init__()
+    self.trust_db = KeyStore(str(Path(self.store_path, "trusted_devices")))
+    self.blacklist_db = KeyStore(str(Path(self.store_path, "blacklisted_devices")))
+    self.ignore_db = KeyStore(str(Path(self.store_path, "ignored_devices")))
+DefaultStore.__post_init__ = _default_store_post_init
+# this could also be fixed by setting store_name in ClientConfig()
+MatrixStore.__post_init_original__ = MatrixStore.__post_init__
+def _matrix_store_post_init(self):
+    self.database_name = self.database_name or "store"
+    self.__post_init_original__()
+MatrixStore.__post_init__ = _matrix_store_post_init
+
+
+data_dir = Path(getenv("XDG_DATA_HOME", Path(Path.home(), ".local/share")), "matrixmail")
+login_path = Path(data_dir, "login")
+login_attrs = ("access_token", "device_id", "homeserver", "user_id")
+
+
+async def join_room(client: AsyncClient, room_id: str):
+    # Calling client.join() is not enough. The client also has to synchronise the state back
+    # from the server before client.room_send() will work.
+    joined = asyncio.Event()
+    def join(room: MatrixRoom, event: RoomMemberEvent):
+        if room.room_id == room_id and event.state_key == client.user_id and event.membership == "join":
+            joined.set()
+    client.add_event_callback(join, RoomMemberEvent)
+    response = await client.join(room_id)
+    if not isinstance(response, JoinResponse):
+        raise RuntimeError(str(response))
+    # FIXME some key exchange events are also necessary or else
+    # ** Unable to decrypt: The sender's device has not sent us the keys for this message. **
+    await asyncio.wait_for(joined.wait(), timeout=30)
+
+
+async def send_message(client: AsyncClient, room_id: str, message: str):
+    if not room_id in client.rooms:
+        await join_room(client, room_id)
+    await asyncio.sleep(10)
+    # FIXME Don't blindly trust every device.
+    for user_id, device_ids in client.device_store.items():
+        for device_id, olm_device in device_ids.items():
+            if user_id == client.user_id and device_id == client.device_id:
+                continue
+            if olm_device.trust_state == TrustState.unset:
+                client.verify_device(olm_device)
+    await client.room_send(room_id, "m.room.message", {"msgtype": "m.text", "body": message})
+
+
+async def mailx() -> Optional[int]:
+    from argparse import ArgumentParser
+    parser = ArgumentParser(description="mailx - send messages via matrix.")
+    parser.add_argument("-s", metavar="subject", dest="subject", help="the message subject.")
+    parser.add_argument("address", nargs="+", help="the matrix room.")
+    args = parser.parse_args()
+    with login_path.open() as f:
+        login = json.load(f)
+    lines = []
+    for line in sys.stdin:
+        # ~ (Tilde) is the default escape character.
+        if line.startswith("~"):
+            continue
+        lines.append(line)
+    message = "".join(lines)
+    if args.subject:
+        message = f"{args.subject}\n\n{message}"
+
+    client = AsyncClient(login["homeserver"], store_path=str(data_dir))
+    client.restore_login(login["user_id"], login["device_id"], login["access_token"])
+    try:
+        sync = asyncio.create_task(client.sync_forever(full_state=True))
+        await client.synced.wait()
+        sends = [send_message(client, room, message) for room in args.address]
+        errors = await asyncio.gather(*sends, return_exceptions=True)
+        success = True
+        for room, error in zip(args.address, errors):
+            if error:
+                print(f"Error sending message to room {room}: {error}", file=sys.stderr)
+                success = False
+        if not success:
+            return 1
+    finally:
+        sync.cancel()
+        await sync
+        await client.close()
+
+
+async def setup() -> Optional[int]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    homeserver = input("Homeserver (default: matrix.org): ")
+    if not homeserver:
+        homeserver = "https://matrix.org"
+    elif not homeserver.startswith(("http://", "https://")):
+        homeserver = f"https://{homeserver}"
+    user = input("User: ")
+    password = getpass("Password: ", stream=sys.stdout)
+    device = input("Device name (optional): ")
+
+    client = AsyncClient(homeserver, user, store_path=str(data_dir))
+    try:
+        login_response = await client.login(password, device_name=device)
+        if not isinstance(login_response, LoginResponse):
+            print(f"Error logging in: {login_response}", file=sys.stderr)
+            return 1
+        with login_path.open("w") as f:
+            json.dump({attr: getattr(client, attr) for attr in login_attrs}, f)
+    finally:
+        await client.close()
+
+
+if __name__ == "__main__":
+    if Path(sys.argv[0]).name.endswith("-setup"):
+        sys.exit(asyncio.run(setup()))
+    else:
+        sys.exit(asyncio.run(mailx()))
