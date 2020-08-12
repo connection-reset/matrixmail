@@ -3,7 +3,7 @@ import asyncio
 import json
 import sys
 from getpass import getpass
-from os import getenv
+from os import getenv, umask
 from pathlib import Path
 from typing import Optional
 
@@ -131,6 +131,7 @@ async def setup() -> Optional[int]:
 
 
 if __name__ == "__main__":
+    umask(0o077)
     if Path(sys.argv[0]).name.endswith("-setup"):
         sys.exit(asyncio.run(setup()))
     else:
