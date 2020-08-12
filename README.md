@@ -19,7 +19,8 @@ It will prompt for your login and save the session:
 Homeserver (default: matrix.org): example.org
 User: alice
 Password: 
-Device name (optional): Alice's Computer
+Device name (default: localhost): Alice's Computer
+Display name (default: Alice@Alice's Computer): 
 ```
 
 ## Usage

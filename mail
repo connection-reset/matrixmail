@@ -2,9 +2,10 @@
 import asyncio
 import json
 import sys
-from getpass import getpass
+from getpass import getpass, getuser
 from os import getenv, umask
 from pathlib import Path
+from socket import gethostname
 from typing import Optional
 
 from nio import (
@@ -109,23 +110,29 @@ async def mailx() -> Optional[int]:
 async def setup() -> Optional[int]:
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    homeserver = input("Homeserver (default: matrix.org): ")
-    if not homeserver:
-        homeserver = "https://matrix.org"
-    elif not homeserver.startswith(("http://", "https://")):
+    default_homeserver = "matrix.org"
+    homeserver = input(f"Homeserver (default: {default_homeserver}): ").strip() \
+            or default_homeserver
+    if not homeserver.startswith(("http://", "https://")):
         homeserver = f"https://{homeserver}"
     user = input("User: ")
     password = getpass("Password: ", stream=sys.stdout)
-    device = input("Device name (optional): ")
+    default_device_name = gethostname()
+    device_name = input(f"Device name (default: {default_device_name}): ").strip() \
+            or default_device_name
+    default_display_name = f"{getuser()}@{device_name}"
+    display_name = input(f"Display name (default: {default_display_name}): ").strip() \
+            or default_display_name
 
     client = AsyncClient(homeserver, user, store_path=str(data_dir))
     try:
-        login_response = await client.login(password, device_name=device)
+        login_response = await client.login(password, device_name=device_name)
         if not isinstance(login_response, LoginResponse):
             print(f"Error logging in: {login_response}", file=sys.stderr)
             return 1
         with login_path.open("w") as f:
             json.dump({attr: getattr(client, attr) for attr in login_attrs}, f)
+        await client.set_displayname(display_name)
     finally:
         await client.close()
 
